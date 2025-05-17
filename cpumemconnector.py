@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 import hashlib
 import os
 from dataclasses import dataclass
@@ -42,6 +41,14 @@ class ReqMeta:
         num_blocks = block_ids_tensor.shape[0]
         block_offsets = torch.arange(0, block_size)
         # 在一个分块的 block 表上，但是最后会 flatten 成一个一维的 index selector.
+        # block_size = 4
+        # block_offsets = [[0,1,2,3]]
+        # block_ids = [1,3,5,6]
+        # block_ids.reshape((num_blocks, 1)) = [[1], [3], [5], [6]]
+        # block_ids.reshape((num_blocks, 1)) * block_size = [[1*4], [3*4], [5*4], [6*4]]
+        # [ [0,1,2,3] + [1*4], [0,1,2,3] + [3*4], [0,1,2,3] + [5*4], [0,1,2,3] + [6*4]]
+        # 利用广播加法的性质
+        # 基于 block id 和 block_size 转换成在一个连续内存的小标索引矩阵然后再flatten。
         slot_mapping = block_offsets.reshape((1, block_size)) + \
                 block_ids_tensor.reshape((num_blocks, 1)) * block_size
         slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
@@ -72,7 +79,8 @@ class SharedCPUMemmoryConnectorMetadata(KVConnectorMetadata):
 
 class SharedCPUMemmoryConnector(KVConnectorBase_V1):
     # NOTE: This is Simple debug implementation of the KV connector.
-    # It save / load the KV cache to / from the disk.
+    # It save / load the KV cache to / from the shared memory.
+    # It does not support the chunk prefill.
     # It does extra work which will overwrite the existing prefix-cache in GPU
     # - to remove the overhead, need to add some "mask" in the ReqMeta class
 
@@ -83,21 +91,21 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
         transfer_config = vllm_config.kv_transfer_config
         self._shared_memory_name = transfer_config.get_from_extra_config(
             "shared_memory_name", "shared_cpu_memory")
-        if vllm_config.kv_rank == 0:
+        if vllm_config.kv_transfer_config.kv_rank == 0:
             # NOTE: this is a hack to make sure that the shared memory is
             # created only once. 
             self._shared_memory = shared_memory.SharedMemory(
                 name=self._shared_memory_name,
                 create=True,
                 size=transfer_config.get_from_extra_config(
-                    "shared_memory_size", 1024 * 1024 * 1024),
+                    "shared_memory_size", 30 * 1024 * 1024 * 1024),
             )
         else:
             self._shared_memory = shared_memory.SharedMemory(
                 name=self._shared_memory_name,
                 create=False,
             )
-        self._request_kvcache_map = dict() # layer.hash(input_ids) -> cpu kv cache
+        self._request_kvcache_map = dict[str, torch.Tensor] = {} # layer.hash(input_ids) -> cpu kv cache
         logger.info(vllm_config.kv_transfer_config)
 
     def start_load_kv(self, forward_context: "ForwardContext",
@@ -175,10 +183,9 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
                 kv_cache_layer = attn_layer.kv_cache[\
                         forward_context.virtual_engine]
                 # 这里应该是默认不开chunk prefill的，每一层的prefill算完就存下来。
-                filename = self._generate_filename_debug(
+                key = self._generate_key_debug(
                     layer_name, request.token_ids)
-                kv_cache = safetensors.torch.load_file(
-                    filename)["kv_cache"].cuda()
+                kv_cache = self._request_kvcache_map[key].cuda()
                 inject_kv_into_layer(kv_cache_layer, kv_cache,
                                      request.slot_mapping)
 
@@ -227,12 +234,11 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
         assert isinstance(connector_metadata, SharedCPUMemmoryConnectorMetadata)
         for request in connector_metadata.requests:
             if request.is_store:
-                filename = self._generate_filename_debug(
+                key = self._generate_key_debug(
                     layer_name, request.token_ids)
                 kv_cache = extract_kv_from_layer(kv_layer,
                                                  request.slot_mapping)
-                tensors = {"kv_cache": kv_cache.detach().cpu()}
-                safetensors.torch.save_file(tensors, filename)
+                self._request_kvcache_map[key] = kv_cache.detach().cpu()
 
     def wait_for_save(self):
         return
