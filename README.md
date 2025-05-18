@@ -16,7 +16,7 @@ By utilizing CPU shared memory for KV transfer, this approach:
 ### Prefill Node
 
 ```bash
-PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B \
+PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B \
     --port 8200 \
     --max-model-len 2048 \
     --gpu-memory-utilization 0.8 \
