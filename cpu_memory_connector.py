@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-# 过滤shared_memory泄漏警告
+# Ignore the shared_memory leak warning, the prefill is responsible to reclaim the shared memory.
 warnings.filterwarnings(
     "ignore", 
     category=UserWarning, 
@@ -54,15 +54,16 @@ class ReqMeta:
         block_ids_tensor = torch.tensor(block_ids)
         num_blocks = block_ids_tensor.shape[0]
         block_offsets = torch.arange(0, block_size)
-        # 在一个分块的 block 表上，但是最后会 flatten 成一个一维的 index selector.
-        # block_size = 4
-        # block_offsets = [[0,1,2,3]]
+        # Creating a flattened index selector from block structure
+        # Example with block_size = 4:
+        # block_offsets = [0,1,2,3]
         # block_ids = [1,3,5,6]
         # block_ids.reshape((num_blocks, 1)) = [[1], [3], [5], [6]]
-        # block_ids.reshape((num_blocks, 1)) * block_size = [[1*4], [3*4], [5*4], [6*4]]
-        # [ [0,1,2,3] + [1*4], [0,1,2,3] + [3*4], [0,1,2,3] + [5*4], [0,1,2,3] + [6*4]]
-        # 利用广播加法的性质
-        # 基于 block id 和 block_size 转换成在一个连续内存的小标索引矩阵然后再flatten。
+        # block_ids.reshape((num_blocks, 1)) * block_size = [[4], [12], [20], [24]]
+        # Using broadcasting: [0,1,2,3] + each block offset
+        # Results in: [[4,5,6,7], [12,13,14,15], [20,21,22,23], [24,25,26,27]]
+        # Then flattens to [4,5,6,7,12,13,14,15,20,21,22,23,24,25,26,27]
+        # This creates sequential indices for accessing contiguous memory blocks
         slot_mapping = (
             block_offsets.reshape((1, block_size))
             + block_ids_tensor.reshape((num_blocks, 1)) * block_size
@@ -186,9 +187,12 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
             for layer_name in forward_context.no_compile_layers:
                 attn_layer = forward_context.no_compile_layers[layer_name]
                 kv_cache_layer = attn_layer.kv_cache[forward_context.virtual_engine]
-                # 这里应该是默认不开chunk prefill的，每一层的prefill算完就存下来。
                 key = self._generate_key_debug(layer_name, request.token_ids)
-                kv_cache = self._request_kvcache_map[key].cuda()
+                kv_cache = self._load_from_shared_memory(
+                    key=key,
+                    shape=kv_cache_layer.shape,
+                    dtype=kv_cache_layer.dtype,
+                ).cuda()
                 inject_kv_into_layer(kv_cache_layer, kv_cache, request.slot_mapping)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -242,7 +246,10 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
                 key = self._generate_key_debug(layer_name, request.token_ids)
                 kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
 
-                self._request_kvcache_map[key] = kv_cache.detach().cpu()
+                self._insert_into_shared_memory(
+                    key=key,
+                    kv_cache=kv_cache.cpu().detach(),
+                )
 
     def wait_for_save(self):
         return
