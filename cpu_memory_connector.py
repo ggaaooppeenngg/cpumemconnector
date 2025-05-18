@@ -49,7 +49,10 @@ class ReqMeta:
     def make_meta(
         token_ids: list[int], block_ids: list[int], block_size: int, is_store: bool
     ) -> "ReqMeta":
+        print("=>>>>>> token ids len", len(token_ids))
+        print("=>>>>>> block size", block_size)
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
+        print("=>>>>>> valid tokens len", valid_num_tokens)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
         block_ids_tensor = torch.tensor(block_ids)
         num_blocks = block_ids_tensor.shape[0]
@@ -95,7 +98,7 @@ class SharedCPUMemmoryConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class SharedCPUMemmoryConnector(KVConnectorBase_V1):
+class SharedCPUMemoryConnector(KVConnectorBase_V1):
     # NOTE: This is Simple debug implementation of the KV connector.
     # It save / load the KV cache to / from the shared memory.
     # It does not support the chunk prefill.
@@ -103,7 +106,7 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
     # - to remove the overhead, need to add some "mask" in the ReqMeta class
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        print("init")
+        logger.info("init")
         super().__init__(vllm_config=vllm_config, role=role)
         self._block_size = vllm_config.cache_config.block_size
         # requests that need to load the KV cache
@@ -143,6 +146,7 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
                 slot_mapping (torch.Tensor): the slot mapping. In shape
                     [num_tokens].
             """
+            # xxx is the kv cache hidden size
             dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
             if isinstance(attn_metadata, MLACommonMetadata):
                 num_pages = dst_kv_cache_layer_shape[0]
@@ -178,7 +182,7 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
 
         # Load the KV for each request each layer
         for request in metadata.requests:
-            if request.is_store:
+            if request.is_store or len(request.token_ids) < self._block_size:
                 continue
             logger.info(
                 "Inject KV cache of %d tokens to the paged memory",
@@ -242,7 +246,7 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, SharedCPUMemmoryConnectorMetadata)
         for request in connector_metadata.requests:
-            if request.is_store:
+            if request.is_store and len(request.token_ids) > self._block_size:
                 key = self._generate_key_debug(layer_name, request.token_ids)
                 kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
 
@@ -377,7 +381,10 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
     # =========
     def _insert_into_shared_memory(self, key: str, kv_cache: torch.Tensor):
         """Insert the KV cache into the shared memory."""
-        kv_cache_np = kv_cache.cpu().numpy()
+        
+        # numpy does not support FP16, so we need to convert it to FP32
+        # before copying to the shared memory
+        kv_cache_np = kv_cache.cpu().float().numpy()
         # Create a shared memory block
         shm = shared_memory.SharedMemory(
             name=key, create=True, size = kv_cache_np.nbytes
@@ -392,9 +399,9 @@ class SharedCPUMemmoryConnector(KVConnectorBase_V1):
         """Load the KV cache from the shared memory."""
         # Create a shared memory block
         shm = shared_memory.SharedMemory(name=key)
-        # Create a numpy array from the shared memory
+        # Create a numpy array from the shared memory using float32
         shm_array = np.ndarray(
-            shape, dtype=dtype.numpy_dtype, buffer=shm.buf
+            shape, dtype=np.float32, buffer=shm.buf
         )
         # Copy the data to the shared memory, kv has the same memory with shm_array
         kv_cache = torch.from_numpy(shm_array)

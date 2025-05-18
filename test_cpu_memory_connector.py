@@ -6,7 +6,7 @@ from vllm.config import CacheConfig, VllmConfig, KVTransferConfig
 import warnings
 
 from cpu_memory_connector import (
-    SharedCPUMemmoryConnector,
+    SharedCPUMemoryConnector,
     ReqMeta,
     SharedCPUMemmoryConnectorMetadata,
     KVConnectorRole,
@@ -23,7 +23,7 @@ def test_kv_cache_insert_retrieve():
         cache_config=cache_config, 
         kv_transfer_config=kv_transfer_config
     )
-    connector = SharedCPUMemmoryConnector(
+    connector = SharedCPUMemoryConnector(
         vllm_config, 
         KVConnectorRole.WORKER
     )
@@ -42,7 +42,7 @@ def test_kv_cache_insert_retrieve():
     # use multiprocessing to spwan a process to retrive the kv cache
     def retrieve_kv_cache(key, shape, dtype, vllm_config):
         # Create a new connector in the child process
-        child_connector = SharedCPUMemmoryConnector(
+        child_connector = SharedCPUMemoryConnector(
             vllm_config,
             KVConnectorRole.WORKER
         )
