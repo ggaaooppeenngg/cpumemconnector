@@ -54,7 +54,3 @@ PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3-0.6B \
 * Ensure that both the prefill and decode nodes are configured consistently, particularly in terms of `kv_parallel_size`.
 * The `kv_rank` should be unique for each process (e.g., `0` for producer, `1` for consumer).
 * This connector must be placed in a Python module or script accessible via the `PYTHONPATH`.
-
----
-
-Let me know if you'd like to add diagrams or examples of the connector implementation.
