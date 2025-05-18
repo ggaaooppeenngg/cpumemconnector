@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# This code is adapted from the vLLM StorageSharedConnector.
 import hashlib
 import os
 from dataclasses import dataclass
@@ -25,7 +27,7 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 
-# Ignore the shared_memory leak warning, the prefill is responsible to reclaim the shared memory.
+# Ignore the shared_memory leak warning, the prefiller is responsible to reclaim the shared memory.
 warnings.filterwarnings(
     "ignore", 
     category=UserWarning, 
@@ -49,10 +51,7 @@ class ReqMeta:
     def make_meta(
         token_ids: list[int], block_ids: list[int], block_size: int, is_store: bool
     ) -> "ReqMeta":
-        print("=>>>>>> token ids len", len(token_ids))
-        print("=>>>>>> block size", block_size)
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
-        print("=>>>>>> valid tokens len", valid_num_tokens)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
         block_ids_tensor = torch.tensor(block_ids)
         num_blocks = block_ids_tensor.shape[0]
@@ -106,9 +105,9 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
     # - to remove the overhead, need to add some "mask" in the ReqMeta class
 
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        logger.info("init")
         super().__init__(vllm_config=vllm_config, role=role)
         self._block_size = vllm_config.cache_config.block_size
+        self._kv_rank = vllm_config.kv_transfer_config.kv_rank
         # requests that need to load the KV cache
         self._requests_need_load: dict[str, Request] = {}
         self._request_kvcache_map = {}  # layer.hash(input_ids) -> cpu kv cache
@@ -127,8 +126,10 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        if self._kv_rank != 1:
+            # Only the KV rank 0(decode) will load the KV cache
+            return
         attn_metadata = forward_context.attn_metadata
-
         def inject_kv_into_layer(
             dst_kv_cache_layer: torch.Tensor,
             src_kv_cache: torch.Tensor,
@@ -179,7 +180,6 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
         if attn_metadata is None:
             logger.warning("In connector.start_load_kv, but the attn_metadata is None")
             return
-
         # Load the KV for each request each layer
         for request in metadata.requests:
             if request.is_store or len(request.token_ids) < self._block_size:
@@ -208,6 +208,7 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
+        #TODO: wait for the key exists in the request_kvcache_map
         return
 
     def save_kv_layer(
@@ -227,7 +228,9 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-
+        if self._kv_rank != 0:
+            # Only the KV rank 0(prefill) will save the KV cache
+            return
         def extract_kv_from_layer(
             layer: torch.Tensor,
             slot_mapping: torch.Tensor,
@@ -249,7 +252,6 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
             if request.is_store and len(request.token_ids) > self._block_size:
                 key = self._generate_key_debug(layer_name, request.token_ids)
                 kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
-
                 self._insert_into_shared_memory(
                     key=key,
                     kv_cache=kv_cache.cpu().detach(),
@@ -287,7 +289,6 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
             return 0, False
 
         logger.info("External Cache Hit!")
-
         # Now, first num_tokens_to_check tokens are hit, we need to prepare
         # the metadata for the worker connector to correctly load the KV
         num_tokens_to_check = align_to_block_size(
@@ -295,7 +296,7 @@ class SharedCPUMemoryConnector(KVConnectorBase_V1):
         )
 
         return num_tokens_to_check - num_computed_tokens, False
-
+    # called after kv cache slots are allocated
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

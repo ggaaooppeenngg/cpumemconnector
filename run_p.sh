@@ -1,7 +1,7 @@
 #!/bin/bash
 PYTHONPATH=$PWD CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-0.6B \
     --port 8100 \
-    --max-model-len 100 \
+    --max-model-len 2048 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --kv-transfer-config \
